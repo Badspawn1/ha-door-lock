@@ -13,9 +13,10 @@ HA Package für automatisches Sperren von SwitchBot Lock Pro/Ultra Schlössern m
 
 ## Entity-Schema
 
-Türkontaktsensor wird automatisch vom Lock-Entity abgeleitet — kein Mapping nötig:
+Türkontaktsensor wird automatisch vom Lock-Entity abgeleitet via generischem Replace `lock.` → `binary_sensor.` — funktioniert für Lock Pro und Lock Ultra, kein Mapping nötig:
 ```
-lock.lock_pro_xxxx  →  binary_sensor.lock_pro_xxxx
+lock.lock_pro_xxxx    →  binary_sensor.lock_pro_xxxx
+lock.lock_ultra_xxxx  →  binary_sensor.lock_ultra_xxxx
 ```
 
 ## Nach Deployment konfigurieren
@@ -32,7 +33,7 @@ In Developer Tools > States:
 - Orchestrator `door_lock_all` feuert alle Schlösser per `script.turn_on` (fire-and-forget), wartet dann auf `script.door_lock_single_with_retry` state == `off`
 - Sperrzeit kann über Mitternacht gehen (Template berücksichtigt start > end)
 - Auto-Relock: wartet auf Türschließen, sperrt dann automatisch nach
-- Kritische Notifications durchbrechen iOS "Nicht stören" via `push.sound.critical: 1`
+- Kritische Notifications cross-platform: iOS via `push.sound.critical: 1`, Android via `channel: alarm_stream_max` + `priority: high` + `ttl: 0` — beide Plattformen ignorieren jeweils fremde Keys
 
 ## Git-Hinweis
 

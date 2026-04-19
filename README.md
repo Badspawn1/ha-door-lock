@@ -14,10 +14,11 @@ Home Assistant Package zum automatischen Sperren von [SwitchBot Lock](https://ww
 
 ## Entity-Schema
 
-Das Package leitet den Türkontaktsensor automatisch vom Lock-Entity ab:
+Das Package leitet den Türkontaktsensor automatisch vom Lock-Entity ab (funktioniert für Lock Pro und Lock Ultra):
 
 ```
-lock.lock_pro_xxxx  ->  binary_sensor.lock_pro_xxxx
+lock.lock_pro_xxxx    ->  binary_sensor.lock_pro_xxxx
+lock.lock_ultra_xxxx  ->  binary_sensor.lock_ultra_xxxx
 ```
 
 Es wird kein separates Mapping benötigt.
@@ -143,7 +144,9 @@ Während der Sperrzeit (22:00 - 06:00):
 | Tür steht zu lange offen | "Tür steht offen!" | Ja |
 | Tür wieder geschlossen | "Tür geschlossen" | Nein |
 
-Kritische Benachrichtigungen durchbrechen den "Nicht stören"-Modus auf iOS.
+Kritische Benachrichtigungen durchbrechen den "Nicht stören"-Modus:
+- **iOS**: via `push.sound.critical` — erfordert in der HA Companion App unter *Benachrichtigungen > Kritische Benachrichtigungen* die Aktivierung je Kategorie
+- **Android**: via Notification-Channel `alarm_stream_max` — nutzt den Alarm-Audiostream und übersteuert DND/Stumm
 
 ## Fehlerverhalten
 

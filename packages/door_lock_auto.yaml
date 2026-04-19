@@ -8,8 +8,13 @@
 #   - Tür-offen-Warnung nach 15 Min.
 #   - Info-Push bei nächtlichem Entriegeln
 #
-# Entity-Schema: lock.lock_pro_XXXX <-> binary_sensor.lock_pro_XXXX
-# Der Kontaktsensor wird automatisch vom Lock-Entity abgeleitet.
+# Entity-Schema: lock.XXXX <-> binary_sensor.XXXX
+# Der Kontaktsensor wird automatisch vom Lock-Entity abgeleitet
+# (funktioniert für Lock Pro und Lock Ultra).
+#
+# Kritische Notifications funktionieren plattformübergreifend:
+#   - iOS: push.sound.critical (durchbricht "Nicht stören")
+#   - Android: channel "alarm_stream_max" (durchbricht DND/Stumm)
 #
 # Einbindung in configuration.yaml:
 #   homeassistant:
@@ -32,15 +37,14 @@
 
 template:
   - binary_sensor:
-      - name: "Alle Türschlösser gesichert"
+      - name: "Door Locks All Secured"
         unique_id: door_locks_all_secured
-        device_class: lock
         icon: mdi:lock-check
         state: >
           {% set lock_ids = states('input_text.door_lock_entities').split(',')
              | map('trim') | reject('eq', '') | list %}
           {% if lock_ids | length == 0 %}
-            false
+            off
           {% else %}
             {% set ns = namespace(all_locked=true) %}
             {% for lock_id in lock_ids %}
@@ -48,11 +52,11 @@ template:
                 {% set ns.all_locked = false %}
               {% endif %}
             {% endfor %}
-            {{ ns.all_locked }}
+            {{ 'on' if ns.all_locked else 'off' }}
           {% endif %}
 
-    sensor:
-      - name: "Türschlösser nicht gesperrt"
+  - sensor:
+      - name: "Door Locks Unlocked List"
         unique_id: door_locks_unlocked_list
         icon: mdi:lock-open-alert
         state: >
@@ -61,12 +65,12 @@ template:
           {% set ns = namespace(unlocked=[]) %}
           {% for lock_id in lock_ids %}
             {% if not is_state(lock_id, 'locked') %}
-              {% set ns.unlocked = ns.unlocked + [state_attr(lock_id, 'friendly_name') | default(lock_id)] %}
+              {% set ns.unlocked = ns.unlocked + [state_attr(lock_id, 'friendly_name') or lock_id] %}
             {% endif %}
           {% endfor %}
           {{ ns.unlocked | join(', ') if ns.unlocked | length > 0 else 'Alle gesperrt' }}
 
-      - name: "Türen offen"
+      - name: "Door Locks Open Doors"
         unique_id: door_locks_open_doors
         icon: mdi:door-open
         state: >
@@ -74,9 +78,9 @@ template:
              | map('trim') | reject('eq', '') | list %}
           {% set ns = namespace(open_doors=[]) %}
           {% for lock_id in lock_ids %}
-            {% set contact = lock_id | replace('lock.lock_pro_', 'binary_sensor.lock_pro_') %}
+            {% set contact = lock_id | replace('lock.', 'binary_sensor.') %}
             {% if is_state(contact, 'on') %}
-              {% set ns.open_doors = ns.open_doors + [state_attr(lock_id, 'friendly_name') | default(lock_id)] %}
+              {% set ns.open_doors = ns.open_doors + [state_attr(lock_id, 'friendly_name') or lock_id] %}
             {% endif %}
           {% endfor %}
           {{ ns.open_doors | join(', ') if ns.open_doors | length > 0 else 'Alle geschlossen' }}
@@ -279,11 +283,16 @@ script:
                 {{ failed_locks }}
                 Bitte manuell prüfen!
               data:
+                # iOS: Critical Notification (durchbricht "Nicht stören")
                 push:
                   sound:
                     name: default
                     critical: 1
                     volume: 1.0
+                # Android: Alarm-Channel (durchbricht DND/Stumm)
+                channel: alarm_stream_max
+                priority: high
+                ttl: 0
       # Benachrichtigung bei Erfolg (optional)
       - if:
           - condition: template
@@ -383,7 +392,7 @@ automation:
           sequence:
             - variables:
                 lock_entity: "{{ repeat.item }}"
-                contact_entity: "{{ repeat.item | replace('lock.lock_pro_', 'binary_sensor.lock_pro_') }}"
+                contact_entity: "{{ repeat.item | replace('lock.', 'binary_sensor.') }}"
                 friendly_name: "{{ state_attr(repeat.item, 'friendly_name') | default(repeat.item) }}"
             # Nur für Schlösser die tatsächlich entriegelt sind
             - if:
@@ -433,11 +442,16 @@ automation:
                 {{ states('sensor.door_locks_unlocked_list') }}
                 Bitte manuell prüfen!
               data:
+                # iOS: Critical Notification (durchbricht "Nicht stören")
                 push:
                   sound:
                     name: default
                     critical: 1
                     volume: 1.0
+                # Android: Alarm-Channel (durchbricht DND/Stumm)
+                channel: alarm_stream_max
+                priority: high
+                ttl: 0
 
   # ---------------------------------------------------------------------------
   # Tür steht zu lange offen (während Sperrzeit)
@@ -491,11 +505,16 @@ automation:
                 {{ states('sensor.door_locks_open_doors') }}
                 steht seit {{ warning_minutes }} Minuten offen!
               data:
+                # iOS: Critical Notification (durchbricht "Nicht stören")
                 push:
                   sound:
                     name: default
                     critical: 1
                     volume: 1.0
+                # Android: Alarm-Channel (durchbricht DND/Stumm)
+                channel: alarm_stream_max
+                priority: high
+                ttl: 0
           # Warten bis Tür geschlossen wird
           - wait_template: "{{ states('sensor.door_locks_open_doors') == 'Alle geschlossen' }}"
             timeout:
