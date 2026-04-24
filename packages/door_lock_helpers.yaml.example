@@ -1,0 +1,65 @@
+# =============================================================================
+# door_lock_helpers.yaml — Template fuer per-Lock-Helper
+# =============================================================================
+# Diese Datei legt alle per-Lock-Helper an (Modus, Sperrfenster Start/Ende,
+# Pause, Warnzeit).
+#
+# NUTZUNG:
+#   1. Kopiere diese Datei zu "packages/door_lock_helpers_local.yaml"
+#      (das Ziel ist in .gitignore — deine echten Entity-IDs kommen nicht auf Github).
+#   2. Ersetze alle <SLUG>-Platzhalter durch deinen Lock-Slug.
+#      Der Slug ist die Entity-ID ohne "lock."-Praefix, z.B.:
+#        lock.lock_pro_xxxx   →  SLUG = lock_pro_xxxx
+#        lock.lock_ultra_yyyy →  SLUG = lock_ultra_yyyy
+#   3. Dupliziere die Bloecke pro Lock einmal und ersetze <SLUG> in jedem.
+#   4. In configuration.yaml einbinden:
+#        homeassistant:
+#          packages:
+#            door_lock_auto:    !include packages/door_lock_auto.yaml
+#            door_lock_helpers: !include packages/door_lock_helpers_local.yaml
+#   5. Home Assistant neu starten. Helper sind unter Settings > Helpers sichtbar
+#      und per Dashboard bedienbar.
+#
+# Welche Helper brauche ich?
+#   - mode:              Pflicht — steuert zentral/individuell/aus
+#   - start + end:       Pflicht wenn mode = individual (definiert das Sperrfenster)
+#   - pause_until:       Optional — ohne Helper gibt es keine Pause-Funktion
+#   - warning_minutes:   Optional — ohne Helper gilt der globale Default
+# =============================================================================
+
+input_select:
+  autolock_<SLUG>_mode:
+    name: "Autolock <SLUG> Modus"
+    icon: mdi:tune
+    options:
+      - "off"
+      - "central"
+      - "individual"
+    initial: "central"
+
+input_datetime:
+  autolock_<SLUG>_start:
+    name: "Autolock <SLUG> Sperrfenster Start"
+    has_time: true
+    icon: mdi:clock-start
+
+  autolock_<SLUG>_end:
+    name: "Autolock <SLUG> Sperrfenster Ende"
+    has_time: true
+    icon: mdi:clock-end
+
+  autolock_<SLUG>_pause_until:
+    name: "Autolock <SLUG> Pause bis"
+    has_date: true
+    has_time: true
+    icon: mdi:pause-circle-outline
+
+input_number:
+  autolock_<SLUG>_warning_minutes:
+    name: "Autolock <SLUG> Warnzeit"
+    min: 5
+    max: 60
+    step: 5
+    initial: 15
+    unit_of_measurement: "min"
+    icon: mdi:door-open

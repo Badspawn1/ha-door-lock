@@ -1,34 +1,55 @@
 # =============================================================================
-# SwitchBot Türschloss - Auto-Lock Package
+# SwitchBot Türschloss - Auto-Lock Package (v3)
 # =============================================================================
-# Automatisches Sperren aller konfigurierten Türschlösser mit:
+# Automatisches Sperren konfigurierbarer Türschlösser mit:
+#   - Pro-Lock-Modus via input_select: off / central / individual
+#     (Dashboard-bedienbar, keine Labels mehr noetig)
+#   - Sperrfenster pro Lock (Start + Ende) — zentral oder individuell
+#   - Auto-Relock waehrend Sperrfenster wenn Tuer zufaellt
+#   - Individuelle Tür-offen-Warnzeit pro Lock (optional)
+#   - Pause-Funktion bis Datum/Zeit X pro Lock (Gäste etc.)
+#   - Master-Override: "Je nach Lock", "Alle aus", "Alle zentral", "Alle individuell"
 #   - Retry-Logik und Statusverifikation pro Schloss
-#   - Push-Benachrichtigung bei Fehler (kritisch) und Erfolg (optional)
-#   - Auto-Relock: Sperrt automatisch wieder wenn Tür zufällt (Sperrzeit)
-#   - Tür-offen-Warnung nach 15 Min.
-#   - Info-Push bei nächtlichem Entriegeln
+#   - Tür-offen-Check VOR dem Sperren
+#   - Cross-Platform kritische Push-Notifications (iOS + Android)
 #
 # Entity-Schema: lock.XXXX <-> binary_sensor.XXXX
-# Der Kontaktsensor wird automatisch vom Lock-Entity abgeleitet
-# (funktioniert für Lock Pro und Lock Ultra).
+# (funktioniert für Lock Pro und Lock Ultra)
 #
-# Kritische Notifications funktionieren plattformübergreifend:
-#   - iOS: push.sound.critical (durchbricht "Nicht stören")
-#   - Android: channel "alarm_stream_max" (durchbricht DND/Stumm)
+# Voraussetzung: Home Assistant 2024.10+ (Sections-Layout im Dashboard)
 #
 # Einbindung in configuration.yaml:
 #   homeassistant:
 #     packages:
-#       door_lock_auto: !include packages/door_lock_auto.yaml
+#       door_lock_auto:       !include packages/door_lock_auto.yaml
+#       door_lock_helpers:    !include packages/door_lock_helpers_local.yaml
+#       door_lock_auto_local: !include packages/door_lock_auto_local.yaml
 #
-# Manueller Trigger über Developer Tools > Events:
+# Diese Datei enthält KEINE konkreten Lock-Entity-IDs. Alle per-Lock-Trigger
+# leben in `door_lock_auto_local.yaml` (gitignored) — Template dafür ist
+# `door_lock_auto_local.yaml.example`.
+#
+# Manueller Trigger (sperrt alle aktiven Locks):
 #   Event Type: door_lock_force
 #
-# WICHTIG - Vor Erstbenutzung:
-#   1. input_text.door_lock_entities mit Lock-Entity-IDs befüllen
-#      Beispiel: "lock.lock_pro_xxxx,lock.lock_pro_yyyy,lock.lock_pro_6d3e"
+# WICHTIG - Setup nach Deployment:
+#   1. input_text.door_lock_entities mit allen Lock-Entity-IDs befüllen
 #   2. input_text.door_lock_notify_service mit Notify-Service setzen
 #   3. input_boolean.door_lock_auto_enabled aktivieren
+#   4. Zentrales Sperrfenster setzen:
+#        input_datetime.door_lock_schedule_start  (z.B. 20:00)
+#        input_datetime.door_lock_schedule_end    (z.B. 06:00)
+#   5. Pro Lock in packages/door_lock_helpers_local.yaml anlegen:
+#        input_select.autolock_<slug>_mode             (off / central / individual)
+#        input_datetime.autolock_<slug>_start          (bei mode=individual)
+#        input_datetime.autolock_<slug>_end            (bei mode=individual)
+#        input_number.autolock_<slug>_warning_minutes  (optional)
+#        input_datetime.autolock_<slug>_pause_until    (optional, has_date + has_time)
+#      <slug> = Lock-Entity-ID ohne "lock." Präfix
+#      (z.B. lock.lock_pro_xxxx → slug = lock_pro_xxxx)
+#   6. Per-Lock-Automations in packages/door_lock_auto_local.yaml anlegen
+#      (siehe Template .example) — state-Trigger für Auto-Relock pro Lock
+#      sowie Zeit-Trigger für individuelle Sperrzeit und Pause-Ablauf.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -36,18 +57,158 @@
 # -----------------------------------------------------------------------------
 
 template:
+  - sensor:
+      - name: "Door Locks Active Config"
+        unique_id: door_locks_active_config
+        icon: mdi:lock-pattern
+        state: >
+          {% set master_on = is_state('input_boolean.door_lock_auto_enabled', 'on') %}
+          {% set master_mode = states('input_select.autolock_master_mode') %}
+          {% set lock_ids = states('input_text.door_lock_entities').split(',')
+             | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(count=0) %}
+          {% for lock_id in lock_ids %}
+            {% set slug = lock_id | replace('lock.', '') %}
+            {% set mode_helper = 'input_select.autolock_' ~ slug ~ '_mode' %}
+            {% set mode_raw = states(mode_helper) %}
+            {% set mode_per_lock = mode_raw if mode_raw in ['off', 'central', 'individual'] else 'off' %}
+            {% set mode = 'off' if master_mode == 'Alle aus'
+               else ('central' if master_mode == 'Alle zentral'
+               else ('individual' if master_mode == 'Alle individuell'
+               else mode_per_lock)) %}
+            {% set pause_state = states('input_datetime.autolock_' ~ slug ~ '_pause_until') %}
+            {% set paused = pause_state not in ['unknown', 'unavailable']
+               and as_timestamp(pause_state, 0) > as_timestamp(now()) %}
+            {% if master_on and mode != 'off' and not paused %}
+              {% set ns.count = ns.count + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.count }}
+        attributes:
+          locks: >
+            {% set master_on = is_state('input_boolean.door_lock_auto_enabled', 'on') %}
+            {% set master_mode = states('input_select.autolock_master_mode') %}
+            {% set lock_ids = states('input_text.door_lock_entities').split(',')
+               | map('trim') | reject('eq', '') | list %}
+            {% set default_warn = states('input_number.door_lock_open_warning_minutes') | int(15) %}
+            {% set central_start_raw = states('input_datetime.door_lock_schedule_start') %}
+            {% set central_end_raw = states('input_datetime.door_lock_schedule_end') %}
+            {% set central_start = central_start_raw[0:5] if central_start_raw not in ['unknown', 'unavailable'] else none %}
+            {% set central_end = central_end_raw[0:5] if central_end_raw not in ['unknown', 'unavailable'] else none %}
+            {% set now_time = now().strftime('%H:%M') %}
+            {% set ns = namespace(result={}) %}
+            {% for lock_id in lock_ids %}
+              {% set slug = lock_id | replace('lock.', '') %}
+              {% set mode_helper = 'input_select.autolock_' ~ slug ~ '_mode' %}
+              {% set mode_raw = states(mode_helper) %}
+              {% set mode_per_lock = mode_raw if mode_raw in ['off', 'central', 'individual'] else 'off' %}
+              {% set mode = 'off' if master_mode == 'Alle aus'
+                 else ('central' if master_mode == 'Alle zentral'
+                 else ('individual' if master_mode == 'Alle individuell'
+                 else mode_per_lock)) %}
+              {% set ind_start_raw = states('input_datetime.autolock_' ~ slug ~ '_start') %}
+              {% set ind_end_raw = states('input_datetime.autolock_' ~ slug ~ '_end') %}
+              {% set ind_start = ind_start_raw[0:5] if ind_start_raw not in ['unknown', 'unavailable'] else none %}
+              {% set ind_end = ind_end_raw[0:5] if ind_end_raw not in ['unknown', 'unavailable'] else none %}
+              {% set effective_start = ind_start if mode == 'individual'
+                 else (central_start if mode == 'central' else none) %}
+              {% set effective_end = ind_end if mode == 'individual'
+                 else (central_end if mode == 'central' else none) %}
+              {% set in_locktime = false %}
+              {% if effective_start and effective_end %}
+                {% if effective_start > effective_end %}
+                  {% set in_locktime = (now_time >= effective_start or now_time < effective_end) %}
+                {% else %}
+                  {% set in_locktime = (now_time >= effective_start and now_time < effective_end) %}
+                {% endif %}
+              {% endif %}
+              {% set warn_state = states('input_number.autolock_' ~ slug ~ '_warning_minutes') %}
+              {% set warn_minutes = warn_state | int(-1) %}
+              {% if warn_minutes < 0 %}{% set warn_minutes = default_warn %}{% endif %}
+              {% set pause_state = states('input_datetime.autolock_' ~ slug ~ '_pause_until') %}
+              {% set has_pause = pause_state not in ['unknown', 'unavailable'] %}
+              {% set paused = has_pause and as_timestamp(pause_state, 0) > as_timestamp(now()) %}
+              {% set active = master_on and mode != 'off' and not paused %}
+              {% set ns.result = ns.result | combine({lock_id: {
+                'mode': mode,
+                'effective_start': effective_start,
+                'effective_end': effective_end,
+                'in_locktime': in_locktime,
+                'warning_minutes': warn_minutes,
+                'paused_until': pause_state if has_pause else none,
+                'paused': paused,
+                'active': active,
+                'friendly_name': state_attr(lock_id, 'friendly_name') or lock_id
+              }}) %}
+            {% endfor %}
+            {{ ns.result }}
+
+      - name: "Autolock Config Issues"
+        unique_id: autolock_config_issues
+        icon: mdi:alert-circle-outline
+        state: >
+          {% set lock_ids = states('input_text.door_lock_entities').split(',')
+             | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(count=0) %}
+          {% for lock_id in lock_ids %}
+            {% set slug = lock_id | replace('lock.', '') %}
+            {% set mode_state = states('input_select.autolock_' ~ slug ~ '_mode') %}
+            {% if mode_state in ['unknown', 'unavailable'] %}
+              {% set ns.count = ns.count + 1 %}
+            {% elif mode_state == 'individual' %}
+              {% set start_state = states('input_datetime.autolock_' ~ slug ~ '_start') %}
+              {% set end_state = states('input_datetime.autolock_' ~ slug ~ '_end') %}
+              {% if start_state in ['unknown', 'unavailable'] %}
+                {% set ns.count = ns.count + 1 %}
+              {% endif %}
+              {% if end_state in ['unknown', 'unavailable'] %}
+                {% set ns.count = ns.count + 1 %}
+              {% endif %}
+            {% endif %}
+            {% if states(lock_id) in ['unknown', 'unavailable'] %}
+              {% set ns.count = ns.count + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.count }}
+        attributes:
+          issues: >
+            {% set lock_ids = states('input_text.door_lock_entities').split(',')
+               | map('trim') | reject('eq', '') | list %}
+            {% set ns = namespace(issues=[]) %}
+            {% for lock_id in lock_ids %}
+              {% set slug = lock_id | replace('lock.', '') %}
+              {% set fname = state_attr(lock_id, 'friendly_name') or lock_id %}
+              {% set mode_state = states('input_select.autolock_' ~ slug ~ '_mode') %}
+              {% if mode_state in ['unknown', 'unavailable'] %}
+                {% set ns.issues = ns.issues + [fname ~ ': Helper input_select.autolock_' ~ slug ~ '_mode fehlt'] %}
+              {% elif mode_state == 'individual' %}
+                {% set start_state = states('input_datetime.autolock_' ~ slug ~ '_start') %}
+                {% set end_state = states('input_datetime.autolock_' ~ slug ~ '_end') %}
+                {% if start_state in ['unknown', 'unavailable'] %}
+                  {% set ns.issues = ns.issues + [fname ~ ': Modus individual aber Helper input_datetime.autolock_' ~ slug ~ '_start fehlt'] %}
+                {% endif %}
+                {% if end_state in ['unknown', 'unavailable'] %}
+                  {% set ns.issues = ns.issues + [fname ~ ': Modus individual aber Helper input_datetime.autolock_' ~ slug ~ '_end fehlt'] %}
+                {% endif %}
+              {% endif %}
+              {% if states(lock_id) in ['unknown', 'unavailable'] %}
+                {% set ns.issues = ns.issues + [fname ~ ': Lock-Entity ' ~ lock_id ~ ' existiert nicht oder ist unavailable'] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.issues }}
+
   - binary_sensor:
       - name: "Door Locks All Secured"
         unique_id: door_locks_all_secured
         icon: mdi:lock-check
         state: >
-          {% set lock_ids = states('input_text.door_lock_entities').split(',')
-             | map('trim') | reject('eq', '') | list %}
-          {% if lock_ids | length == 0 %}
-            off
+          {% set cfg = state_attr('sensor.door_locks_active_config', 'locks') or {} %}
+          {% set active_locks = cfg.items() | selectattr('1.active') | list %}
+          {% if active_locks | length == 0 %}
+            on
           {% else %}
             {% set ns = namespace(all_locked=true) %}
-            {% for lock_id in lock_ids %}
+            {% for lock_id, info in active_locks %}
               {% if not is_state(lock_id, 'locked') %}
                 {% set ns.all_locked = false %}
               {% endif %}
@@ -60,12 +221,11 @@ template:
         unique_id: door_locks_unlocked_list
         icon: mdi:lock-open-alert
         state: >
-          {% set lock_ids = states('input_text.door_lock_entities').split(',')
-             | map('trim') | reject('eq', '') | list %}
+          {% set cfg = state_attr('sensor.door_locks_active_config', 'locks') or {} %}
           {% set ns = namespace(unlocked=[]) %}
-          {% for lock_id in lock_ids %}
-            {% if not is_state(lock_id, 'locked') %}
-              {% set ns.unlocked = ns.unlocked + [state_attr(lock_id, 'friendly_name') or lock_id] %}
+          {% for lock_id, info in cfg.items() %}
+            {% if info.active and not is_state(lock_id, 'locked') %}
+              {% set ns.unlocked = ns.unlocked + [info.friendly_name] %}
             {% endif %}
           {% endfor %}
           {{ ns.unlocked | join(', ') if ns.unlocked | length > 0 else 'Alle gesperrt' }}
@@ -91,25 +251,36 @@ template:
 
 input_boolean:
   door_lock_auto_enabled:
-    name: "Türschloss Auto-Lock Enabled"
+    name: "Türschloss Auto-Lock Aktiv"
     icon: mdi:lock-clock
 
   door_lock_notify_success:
     name: "Türschloss Erfolgs-Benachrichtigung"
     icon: mdi:bell-check
 
+input_select:
+  autolock_master_mode:
+    name: "Türschloss Master-Modus"
+    icon: mdi:cog
+    options:
+      - "Je nach Lock"
+      - "Alle aus"
+      - "Alle zentral"
+      - "Alle individuell"
+    initial: "Je nach Lock"
+
 input_datetime:
-  door_lock_schedule_time:
-    name: "Türschloss Sperrzeit Beginn"
+  door_lock_schedule_start:
+    name: "Türschloss Zentrales Sperrfenster Start"
     has_date: false
     has_time: true
-    icon: mdi:clock-outline
+    icon: mdi:clock-start
 
   door_lock_schedule_end:
-    name: "Türschloss Sperrzeit Ende"
+    name: "Türschloss Zentrales Sperrfenster Ende"
     has_date: false
     has_time: true
-    icon: mdi:clock-outline
+    icon: mdi:clock-end
 
 input_number:
   door_lock_retry_count:
@@ -139,7 +310,7 @@ input_number:
     icon: mdi:timer-check
 
   door_lock_open_warning_minutes:
-    name: "Türschloss Tür-offen-Warnung (Min.)"
+    name: "Türschloss Tür-offen-Warnung Default (Min.)"
     min: 5
     max: 60
     step: 5
@@ -157,7 +328,7 @@ input_text:
 
   door_lock_notify_service:
     name: "Türschloss Notify-Service"
-    # z.B. "notify.mobile_app_lars_iphone"
+    # z.B. "notify.mobile_app_pixel_8_pro"
     max: 255
     icon: mdi:cellphone-message
 
@@ -167,7 +338,7 @@ input_text:
 
 script:
   # ---------------------------------------------------------------------------
-  # Script 1: Einzelschloss mit Retry-Logik
+  # Script 1: Einzelschloss mit Retry-Logik (unverändert)
   # ---------------------------------------------------------------------------
   door_lock_single_with_retry:
     alias: "Türschloss - Einzelschloss mit Retry sperren"
@@ -183,68 +354,153 @@ script:
           max_retries: "{{ states('input_number.door_lock_retry_count') | int }}"
           retry_delay: "{{ states('input_number.door_lock_retry_delay') | int }}"
           verify_timeout: "{{ states('input_number.door_lock_verify_timeout') | int }}"
-          friendly_name: "{{ state_attr(lock_entity, 'friendly_name') | default(lock_entity) }}"
-      # Bereits gesperrt? Dann nichts tun.
+          contact_entity: "{{ lock_entity | replace('lock.', 'binary_sensor.') }}"
+          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
+          cfg: "{{ state_attr('sensor.door_locks_active_config', 'locks') or {} }}"
+          wait_minutes: >
+            {{ (cfg.get(lock_entity, {}).get('warning_minutes',
+               states('input_number.door_lock_open_warning_minutes'))) | int }}
+          friendly: "{{ state_attr(lock_entity, 'friendly_name') or lock_entity }}"
       - if:
           - condition: template
             value_template: "{{ is_state(lock_entity, 'locked') }}"
         then:
           - stop: "Schloss bereits gesperrt"
-      # Retry-Schleife
+      - if:
+          - condition: template
+            value_template: "{{ is_state(contact_entity, 'on') }}"
+        then:
+          - action: "{{ notify_service }}"
+            data:
+              title: "Türschloss WARNUNG"
+              message: >
+                {{ friendly }}: Tür offen — Sperren wartet
+                bis zu {{ wait_minutes }} Min. auf Schließen.
+              data:
+                push:
+                  sound:
+                    name: default
+                    critical: 1
+                    volume: 1.0
+                channel: alarm_stream_max
+                priority: high
+                ttl: 0
+          - wait_template: "{{ is_state(contact_entity, 'off') }}"
+            timeout:
+              minutes: "{{ wait_minutes }}"
+            continue_on_timeout: true
+          - if:
+              - condition: template
+                value_template: "{{ is_state(contact_entity, 'on') }}"
+            then:
+              - action: "{{ notify_service }}"
+                data:
+                  title: "Türschloss NICHT GESPERRT"
+                  message: >
+                    {{ friendly }}: Tür blieb über {{ wait_minutes }} Min.
+                    offen — Schloss wurde NICHT gesperrt. Bitte manuell prüfen!
+                  data:
+                    push:
+                      sound:
+                        name: default
+                        critical: 1
+                        volume: 1.0
+                    channel: alarm_stream_max
+                    priority: high
+                    ttl: 0
+              - stop: "Tür offen geblieben, Lock abgebrochen"
+          - delay:
+              seconds: 3
       - repeat:
           count: "{{ max_retries }}"
           sequence:
-            # Abbrechen falls bereits gesperrt (vorheriger Versuch erfolgreich)
             - if:
                 - condition: template
                   value_template: "{{ is_state(lock_entity, 'locked') }}"
               then:
                 - stop: "Schloss gesperrt nach Retry"
-            # Lock-Befehl senden
             - action: lock.lock
               target:
                 entity_id: "{{ lock_entity }}"
-            # Warten auf Statusänderung
             - wait_template: "{{ is_state(lock_entity, 'locked') }}"
               timeout:
                 seconds: "{{ verify_timeout }}"
               continue_on_timeout: true
-            # Prüfen ob erfolgreich
             - if:
                 - condition: template
                   value_template: "{{ is_state(lock_entity, 'locked') }}"
               then:
                 - stop: "Schloss erfolgreich gesperrt"
-            # Nicht gesperrt - warten vor nächstem Versuch (außer beim letzten)
             - if:
                 - condition: template
                   value_template: "{{ repeat.index < max_retries }}"
               then:
                 - delay:
                     seconds: "{{ retry_delay }}"
-
-  # ---------------------------------------------------------------------------
-  # Script 2: Alle Schlösser sperren (Orchestrator)
-  # ---------------------------------------------------------------------------
-  door_lock_all:
-    alias: "Türschlösser - Alle sperren"
-    icon: mdi:lock
-    mode: single
-    sequence:
-      - variables:
-          lock_ids: >
-            {{ states('input_text.door_lock_entities').split(',')
-               | map('trim') | reject('eq', '') | list }}
-          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
-      # Prüfung: Sind Schlösser konfiguriert?
+      # Alle Retries aufgebraucht und Lock noch nicht gesperrt → kritische Push.
+      # Jeder parallele Script-Run pusht für sein eigenes Lock — keine aggregierte
+      # Meldung mehr im door_lock_group nötig.
       - if:
           - condition: template
-            value_template: "{{ lock_ids | length == 0 }}"
+            value_template: "{{ not is_state(lock_entity, 'locked') }}"
         then:
-          - stop: "Keine Schlösser konfiguriert"
-      # Alle Schlösser parallel starten (fire-and-forget)
+          - action: "{{ notify_service }}"
+            data:
+              title: "Türschloss NICHT GESPERRT"
+              message: >
+                {{ friendly }}: konnte nach {{ max_retries }} Versuchen nicht
+                gesperrt werden. Bitte manuell prüfen!
+              data:
+                push:
+                  sound:
+                    name: default
+                    critical: 1
+                    volume: 1.0
+                channel: alarm_stream_max
+                priority: high
+                ttl: 0
+
+  # ---------------------------------------------------------------------------
+  # Script 2: Gruppe von Schlössern sperren (Orchestrator)
+  # ---------------------------------------------------------------------------
+  door_lock_group:
+    alias: "Türschlösser - Gruppe sperren"
+    icon: mdi:lock
+    mode: single
+    fields:
+      mode:
+        description: "Welche Gruppe sperren: central, individual, all, list"
+        example: "central"
+      locks:
+        description: "Explizite Lock-IDs (nur bei mode=list)"
+        example: "['lock.lock_pro_xxxx']"
+    sequence:
+      - variables:
+          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
+          cfg: "{{ state_attr('sensor.door_locks_active_config', 'locks') or {} }}"
+          target_locks: >
+            {% if mode == 'list' %}
+              {{ locks }}
+            {% elif mode == 'all' %}
+              {{ cfg.items() | selectattr('1.active') | map(attribute='0') | list }}
+            {% elif mode == 'central' %}
+              {{ cfg.items() | selectattr('1.active')
+                 | selectattr('1.mode', 'eq', 'central')
+                 | map(attribute='0') | list }}
+            {% elif mode == 'individual' %}
+              {{ cfg.items() | selectattr('1.active')
+                 | selectattr('1.mode', 'eq', 'individual')
+                 | map(attribute='0') | list }}
+            {% else %}
+              []
+            {% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ target_locks | length == 0 }}"
+        then:
+          - stop: "Keine Ziel-Locks für Modus {{ mode }}"
       - repeat:
-          for_each: "{{ lock_ids }}"
+          for_each: "{{ target_locks }}"
           sequence:
             - action: script.turn_on
               target:
@@ -252,7 +508,6 @@ script:
               data:
                 variables:
                   lock_entity: "{{ repeat.item }}"
-      # Warten bis alle Retry-Instanzen fertig
       - variables:
           max_wait: >
             {{ (states('input_number.door_lock_retry_count') | int)
@@ -263,40 +518,22 @@ script:
         timeout:
           seconds: "{{ max_wait }}"
         continue_on_timeout: true
-      # Settle-Time für State-Updates
       - delay:
           seconds: 5
-      # Ergebnis prüfen
+      # Failure-Pushes werden vom single_with_retry pro Lock selbst versendet.
+      # Hier nur noch die aggregierte Erfolgs-Meldung (opt-in).
       - variables:
-          all_locked: "{{ is_state('binary_sensor.door_locks_all_secured', 'on') }}"
-          failed_locks: "{{ states('sensor.door_locks_unlocked_list') }}"
-      # Benachrichtigung bei Fehler (immer, kritisch)
+          success_count: >
+            {% set ns = namespace(count=0) %}
+            {% for lock_id in target_locks %}
+              {% if is_state(lock_id, 'locked') %}
+                {% set ns.count = ns.count + 1 %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.count }}
       - if:
           - condition: template
-            value_template: "{{ not all_locked }}"
-        then:
-          - action: "{{ notify_service }}"
-            data:
-              title: "Türschloss WARNUNG"
-              message: >
-                Folgende Schlösser konnten nicht gesperrt werden:
-                {{ failed_locks }}
-                Bitte manuell prüfen!
-              data:
-                # iOS: Critical Notification (durchbricht "Nicht stören")
-                push:
-                  sound:
-                    name: default
-                    critical: 1
-                    volume: 1.0
-                # Android: Alarm-Channel (durchbricht DND/Stumm)
-                channel: alarm_stream_max
-                priority: high
-                ttl: 0
-      # Benachrichtigung bei Erfolg (optional)
-      - if:
-          - condition: template
-            value_template: "{{ all_locked }}"
+            value_template: "{{ success_count == target_locks | length and success_count > 0 }}"
           - condition: state
             entity_id: input_boolean.door_lock_notify_success
             state: "on"
@@ -305,8 +542,113 @@ script:
             data:
               title: "Türschlösser gesichert"
               message: >
-                Alle {{ lock_ids | length }} Schlösser erfolgreich gesperrt
+                {{ success_count }} Schloss/Schlösser erfolgreich gesperrt
                 ({{ now().strftime('%H:%M') }}).
+
+  # ---------------------------------------------------------------------------
+  # Script 3: Pause für ein Lock setzen (für Dashboard-Buttons)
+  # ---------------------------------------------------------------------------
+  door_lock_pause:
+    alias: "Türschloss - Pause setzen"
+    icon: mdi:pause-circle
+    mode: parallel
+    max: 10
+    fields:
+      lock_entity:
+        description: "Entity-ID des Schlosses"
+        example: "lock.lock_pro_xxxx"
+      hours:
+        description: "Stunden bis Pause-Ende (ab jetzt)"
+        example: 2
+    sequence:
+      - variables:
+          slug: "{{ lock_entity | replace('lock.', '') }}"
+          pause_helper: "input_datetime.autolock_{{ slug }}_pause_until"
+          target_ts: "{{ (now() + timedelta(hours=hours | int)).strftime('%Y-%m-%d %H:%M:%S') }}"
+          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
+      - if:
+          - condition: template
+            value_template: "{{ states(pause_helper) in ['unknown', 'unavailable'] }}"
+        then:
+          - action: "{{ notify_service }}"
+            data:
+              title: "Türschloss Pause"
+              message: >
+                Fehler: Helper {{ pause_helper }} nicht angelegt.
+                Bitte in Settings > Helpers erstellen.
+          - stop: "Helper fehlt"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: "{{ pause_helper }}"
+        data:
+          datetime: "{{ target_ts }}"
+
+  # ---------------------------------------------------------------------------
+  # Script 4: Pause bis morgen früh
+  # ---------------------------------------------------------------------------
+  door_lock_pause_until_morning:
+    alias: "Türschloss - Pause bis morgen früh"
+    icon: mdi:weather-sunset-up
+    mode: parallel
+    max: 10
+    fields:
+      lock_entity:
+        description: "Entity-ID des Schlosses"
+        example: "lock.lock_pro_xxxx"
+      morning_hour:
+        description: "Stunde am nächsten Morgen (Standard 8)"
+        example: 8
+    sequence:
+      - variables:
+          slug: "{{ lock_entity | replace('lock.', '') }}"
+          pause_helper: "input_datetime.autolock_{{ slug }}_pause_until"
+          hour: "{{ (morning_hour | default(8)) | int }}"
+          target_ts: >
+            {{ (now() + timedelta(days=1)).replace(hour=hour, minute=0, second=0, microsecond=0)
+               .strftime('%Y-%m-%d %H:%M:%S') }}
+          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
+      - if:
+          - condition: template
+            value_template: "{{ states(pause_helper) in ['unknown', 'unavailable'] }}"
+        then:
+          - action: "{{ notify_service }}"
+            data:
+              title: "Türschloss Pause"
+              message: >
+                Fehler: Helper {{ pause_helper }} nicht angelegt.
+                Bitte in Settings > Helpers erstellen.
+          - stop: "Helper fehlt"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: "{{ pause_helper }}"
+        data:
+          datetime: "{{ target_ts }}"
+
+  # ---------------------------------------------------------------------------
+  # Script 5: Pause aufheben
+  # ---------------------------------------------------------------------------
+  door_lock_unpause:
+    alias: "Türschloss - Pause aufheben"
+    icon: mdi:play-circle
+    mode: parallel
+    max: 10
+    fields:
+      lock_entity:
+        description: "Entity-ID des Schlosses"
+        example: "lock.lock_pro_xxxx"
+    sequence:
+      - variables:
+          slug: "{{ lock_entity | replace('lock.', '') }}"
+          pause_helper: "input_datetime.autolock_{{ slug }}_pause_until"
+      - if:
+          - condition: template
+            value_template: "{{ states(pause_helper) not in ['unknown', 'unavailable'] }}"
+        then:
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "{{ pause_helper }}"
+            data:
+              datetime: "2000-01-01 00:00:00"
 
 # -----------------------------------------------------------------------------
 # Automations
@@ -314,16 +656,16 @@ script:
 
 automation:
   # ---------------------------------------------------------------------------
-  # Zeitgesteuerte Sperrung
+  # Zentrale Sperrung (alle zentral-Locks + manuelles Force)
   # ---------------------------------------------------------------------------
-  - id: door_lock_scheduled
-    alias: "Türschlösser - Zeitgesteuerte Sperrung"
-    description: "Sperrt alle konfigurierten Schlösser zur eingestellten Zeit"
+  - id: door_lock_scheduled_central
+    alias: "Türschlösser - Zentrale Sperrzeit"
+    description: "Sperrt alle Locks im zentralen Modus zum Sperrfenster-Start. Force-Event sperrt alle aktiven."
     mode: single
 
     triggers:
       - trigger: time
-        at: input_datetime.door_lock_schedule_time
+        at: input_datetime.door_lock_schedule_start
         id: scheduled
       - trigger: event
         event_type: door_lock_force
@@ -339,188 +681,134 @@ automation:
             state: "on"
 
     actions:
-      - action: script.door_lock_all
+      - action: script.door_lock_group
+        data:
+          mode: >
+            {{ 'all' if trigger.id == 'manual' else 'central' }}
 
   # ---------------------------------------------------------------------------
-  # Nachts entriegelt: Info-Push + Auto-Relock wenn Tür zufällt
+  # HINWEIS: Die drei Automations mit per-Lock-Triggern
+  #   - door_lock_scheduled_individual
+  #   - door_lock_pause_expired
+  #   - door_lock_unlocked_during_locktime
+  # leben in `packages/door_lock_auto_local.yaml` (gitignored), da sie
+  # konkrete Entity-IDs benötigen. Template dafür:
+  #   `packages/door_lock_auto_local.yaml.example`
   # ---------------------------------------------------------------------------
-  - id: door_lock_unlocked_during_locktime
-    alias: "Türschlösser - Entriegelt während Sperrzeit"
-    description: "Info-Push bei Entriegelung, automatisches Sperren wenn Tür zufällt"
-    mode: parallel
-    max: 10
+
+  # ---------------------------------------------------------------------------
+  # Config-Sync: überwacht Inkonsistenzen und meldet sie
+  # ---------------------------------------------------------------------------
+  - id: door_lock_config_sync
+    alias: "Türschlösser - Config-Sync-Check"
+    description: "Meldet Inkonsistenzen in der Lock-Config (fehlende Helper etc.)."
+    mode: single
 
     triggers:
       - trigger: state
-        entity_id: binary_sensor.door_locks_all_secured
-        from: "on"
-        to: "off"
+        entity_id: sensor.autolock_config_issues
+        not_from:
+          - "unknown"
+          - "unavailable"
+        not_to:
+          - "unknown"
+          - "unavailable"
 
     conditions:
-      - condition: state
-        entity_id: input_boolean.door_lock_auto_enabled
-        state: "on"
-      # Nur während der Sperrzeit
       - condition: template
-        value_template: >
-          {% set now_time = now().strftime('%H:%M') %}
-          {% set start = states('input_datetime.door_lock_schedule_time')[0:5] %}
-          {% set end = states('input_datetime.door_lock_schedule_end')[0:5] %}
-          {% if start > end %}
-            {{ now_time >= start or now_time < end }}
-          {% else %}
-            {{ now_time >= start and now_time < end }}
-          {% endif %}
+        value_template: "{{ trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}"
 
     actions:
       - variables:
           notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
-          lock_ids: >
-            {{ states('input_text.door_lock_entities').split(',')
-               | map('trim') | reject('eq', '') | list }}
-      # Info-Push: Schloss wurde entriegelt
+          issues: "{{ state_attr('sensor.autolock_config_issues', 'issues') or [] }}"
       - action: "{{ notify_service }}"
         data:
-          title: "Türschloss entriegelt"
+          title: "Türschloss Config-Problem"
           message: >
-            {{ states('sensor.door_locks_unlocked_list') }}
-            wurde entriegelt ({{ now().strftime('%H:%M') }}).
-            Wird automatisch gesperrt sobald die Tür geschlossen ist.
-      # Auf jedes entriegelte Schloss warten bis Tür zufällt
-      - repeat:
-          for_each: "{{ lock_ids }}"
-          sequence:
-            - variables:
-                lock_entity: "{{ repeat.item }}"
-                contact_entity: "{{ repeat.item | replace('lock.', 'binary_sensor.') }}"
-                friendly_name: "{{ state_attr(repeat.item, 'friendly_name') | default(repeat.item) }}"
-            # Nur für Schlösser die tatsächlich entriegelt sind
-            - if:
-                - condition: template
-                  value_template: "{{ not is_state(lock_entity, 'locked') }}"
-              then:
-                # Warten bis Tür geschlossen (contact = off)
-                - wait_template: "{{ is_state(contact_entity, 'off') }}"
-                  timeout:
-                    minutes: 60
-                  continue_on_timeout: true
-                # Kurz warten damit die Tür richtig ins Schloss fällt
-                - delay:
-                    seconds: 3
-                # Auto-Relock mit Retry
-                - action: script.turn_on
-                  target:
-                    entity_id: script.door_lock_single_with_retry
-                  data:
-                    variables:
-                      lock_entity: "{{ lock_entity }}"
-      # Warten bis Retry-Scripts fertig
-      - wait_template: >
-          {{ is_state('script.door_lock_single_with_retry', 'off') }}
-        timeout:
-          minutes: 5
-        continue_on_timeout: true
-      - delay:
-          seconds: 5
-      # Ergebnis-Push
-      - if:
-          - condition: state
-            entity_id: binary_sensor.door_locks_all_secured
-            state: "on"
-        then:
-          - action: "{{ notify_service }}"
-            data:
-              title: "Türschlösser gesichert"
-              message: >
-                Alle Schlösser wieder gesperrt ({{ now().strftime('%H:%M') }}).
-        else:
-          - action: "{{ notify_service }}"
-            data:
-              title: "Türschloss WARNUNG"
-              message: >
-                Nicht alle Schlösser konnten wieder gesperrt werden:
-                {{ states('sensor.door_locks_unlocked_list') }}
-                Bitte manuell prüfen!
-              data:
-                # iOS: Critical Notification (durchbricht "Nicht stören")
-                push:
-                  sound:
-                    name: default
-                    critical: 1
-                    volume: 1.0
-                # Android: Alarm-Channel (durchbricht DND/Stumm)
-                channel: alarm_stream_max
-                priority: high
-                ttl: 0
+            {{ issues | join('\n') }}
 
   # ---------------------------------------------------------------------------
-  # Tür steht zu lange offen (während Sperrzeit)
+  # Tür steht zu lange offen (per-Lock-Warnzeit)
   # ---------------------------------------------------------------------------
   - id: door_lock_door_open_warning
     alias: "Türschlösser - Tür steht offen Warnung"
-    description: "Warnt wenn eine Tür während der Sperrzeit zu lange offen steht"
+    description: "Warnt pro Lock im eigenen Sperrfenster mit dessen effektiver Warnzeit."
     mode: parallel
     max: 10
 
     triggers:
       - trigger: state
         entity_id: sensor.door_locks_open_doors
-        # Triggert wenn sich die Liste ändert (= eine Tür wurde geöffnet)
 
     conditions:
       - condition: state
         entity_id: input_boolean.door_lock_auto_enabled
         state: "on"
       - condition: template
-        value_template: "{{ states('sensor.door_locks_open_doors') != 'Alle geschlossen' }}"
-      # Nur während der Sperrzeit
+        value_template: "{{ states('sensor.door_locks_open_doors') not in ['Alle geschlossen', 'unknown', 'unavailable'] }}"
       - condition: template
         value_template: >
-          {% set now_time = now().strftime('%H:%M') %}
-          {% set start = states('input_datetime.door_lock_schedule_time')[0:5] %}
-          {% set end = states('input_datetime.door_lock_schedule_end')[0:5] %}
-          {% if start > end %}
-            {{ now_time >= start or now_time < end }}
-          {% else %}
-            {{ now_time >= start and now_time < end }}
-          {% endif %}
+          {% set cfg = state_attr('sensor.door_locks_active_config', 'locks') or {} %}
+          {% set ns = namespace(any=false) %}
+          {% for lock_id, info in cfg.items() %}
+            {% set contact = lock_id | replace('lock.', 'binary_sensor.') %}
+            {% if info.active and info.in_locktime and is_state(contact, 'on') %}
+              {% set ns.any = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.any }}
 
     actions:
       - variables:
           notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
-          open_doors: "{{ states('sensor.door_locks_open_doors') }}"
-          warning_minutes: "{{ states('input_number.door_lock_open_warning_minutes') | int }}"
-      # Warten ob die Tür von alleine zugeht
+          cfg: "{{ state_attr('sensor.door_locks_active_config', 'locks') or {} }}"
+          min_warn: >
+            {% set ns = namespace(min=999) %}
+            {% for lock_id, info in cfg.items() %}
+              {% set contact = lock_id | replace('lock.', 'binary_sensor.') %}
+              {% if info.active and info.in_locktime and is_state(contact, 'on') %}
+                {% if info.warning_minutes < ns.min %}
+                  {% set ns.min = info.warning_minutes %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.min if ns.min < 999 else states('input_number.door_lock_open_warning_minutes') | int }}
       - delay:
-          minutes: "{{ warning_minutes }}"
-      # Ist die Tür immer noch offen?
+          minutes: "{{ min_warn }}"
+      - variables:
+          still_open: >
+            {% set ns = namespace(names=[]) %}
+            {% for lock_id, info in cfg.items() %}
+              {% set contact = lock_id | replace('lock.', 'binary_sensor.') %}
+              {% if info.active and info.in_locktime and is_state(contact, 'on') %}
+                {% set ns.names = ns.names + [info.friendly_name] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.names }}
       - if:
           - condition: template
-            value_template: "{{ states('sensor.door_locks_open_doors') != 'Alle geschlossen' }}"
+            value_template: "{{ still_open | length > 0 }}"
         then:
           - action: "{{ notify_service }}"
             data:
               title: "Tür steht offen!"
               message: >
-                {{ states('sensor.door_locks_open_doors') }}
-                steht seit {{ warning_minutes }} Minuten offen!
+                {{ still_open | join(', ') }}
+                steht seit {{ min_warn }} Minuten offen!
               data:
-                # iOS: Critical Notification (durchbricht "Nicht stören")
                 push:
                   sound:
                     name: default
                     critical: 1
                     volume: 1.0
-                # Android: Alarm-Channel (durchbricht DND/Stumm)
                 channel: alarm_stream_max
                 priority: high
                 ttl: 0
-          # Warten bis Tür geschlossen wird
           - wait_template: "{{ states('sensor.door_locks_open_doors') == 'Alle geschlossen' }}"
             timeout:
               minutes: 60
             continue_on_timeout: true
-          # Bestätigung wenn geschlossen
           - if:
               - condition: template
                 value_template: "{{ states('sensor.door_locks_open_doors') == 'Alle geschlossen' }}"

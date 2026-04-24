@@ -5,3 +5,10 @@ Thumbs.db
 # Editor files
 .vscode/
 .idea/
+
+# Lokale Dateien mit echten Entity-IDs — nicht committen
+packages/door_lock_helpers_local.yaml
+packages/door_lock_auto_local.yaml
+
+# Produktiv-Dashboard enthält konkrete Lock-IDs — lokal halten
+dashboards/

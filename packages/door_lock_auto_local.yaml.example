@@ -1,0 +1,172 @@
+# =============================================================================
+# door_lock_auto_local.yaml — Template für per-Lock-Automations
+# =============================================================================
+# Diese Datei enthält die Automations, deren Trigger die konkreten
+# Lock-Entity-IDs brauchen. HA-Automation-Trigger sind zur Load-Time
+# statisch — sie können nicht dynamisch aus der Lock-Liste erzeugt werden.
+#
+# Deshalb leben diese drei Automations NICHT in der öffentlichen
+# `door_lock_auto.yaml`, sondern hier lokal mit deinen echten Entity-IDs.
+#
+# NUTZUNG:
+#   1. Kopiere diese Datei zu "packages/door_lock_auto_local.yaml"
+#      (das Ziel ist in .gitignore — deine echten Entity-IDs landen nicht auf Github).
+#   2. Ersetze alle <SLUG>-Platzhalter durch deinen Lock-Slug.
+#      Der Slug ist die Entity-ID ohne "lock."-Präfix, z.B.:
+#        lock.lock_pro_xxxx   →  SLUG = lock_pro_xxxx
+#   3. Pro Lock Trigger-Zeilen duplizieren und jeweils <SLUG> ersetzen.
+#   4. In configuration.yaml einbinden (Reihenfolge egal):
+#        homeassistant:
+#          packages:
+#            door_lock_auto:       !include packages/door_lock_auto.yaml
+#            door_lock_helpers:    !include packages/door_lock_helpers_local.yaml
+#            door_lock_auto_local: !include packages/door_lock_auto_local.yaml
+#   5. Home Assistant neu starten oder Automations reloaden.
+#
+# Welche Automation brauche ich wann?
+#   - unlocked_during_locktime: Pflicht pro Lock — sonst kein Auto-Relock bei
+#                               manuellem Entriegeln während des Sperrfensters.
+#   - scheduled_individual:     Pflicht nur für Locks im Modus "individual".
+#   - pause_expired:            Optional, nur wenn du `pause_until` nutzt.
+# =============================================================================
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Individuelle Sperrzeiten
+  # ---------------------------------------------------------------------------
+  - id: door_lock_scheduled_individual
+    alias: "Türschlösser - Individuelle Sperrzeit"
+    description: "Sperrt einzelne Locks zu deren individuellen Start-Zeiten."
+    mode: parallel
+    max: 20
+
+    triggers:
+      # Manueller Test-Trigger (Event mit data.lock_entity):
+      - trigger: event
+        event_type: autolock_individual_manual_trigger
+        id: manual
+      # Pro individuellem Lock eine Zeile — <SLUG> jeweils ersetzen:
+      - trigger: time
+        at: input_datetime.autolock_<SLUG>_start
+        id: scheduled
+      # - trigger: time
+      #   at: input_datetime.autolock_<SLUG>_start
+      #   id: scheduled
+
+    conditions:
+      - condition: state
+        entity_id: input_boolean.door_lock_auto_enabled
+        state: "on"
+
+    actions:
+      - variables:
+          lock_entity: >
+            {% if trigger.id == 'manual' %}
+              {{ trigger.event.data.lock_entity | default('') }}
+            {% else %}
+              {% set eid = trigger.entity_id %}
+              lock.{{ eid | replace('input_datetime.autolock_', '') | regex_replace('_start$', '') }}
+            {% endif %}
+          cfg: "{{ state_attr('sensor.door_locks_active_config', 'locks') or {} }}"
+          lock_info: "{{ cfg.get(lock_entity, {}) }}"
+      - if:
+          - condition: template
+            value_template: "{{ lock_info.get('active', false) and lock_info.get('mode') == 'individual' }}"
+        then:
+          - action: script.door_lock_group
+            data:
+              mode: "list"
+              locks: "{{ [lock_entity] }}"
+
+  # ---------------------------------------------------------------------------
+  # Pause-Ablauf-Benachrichtigung
+  # ---------------------------------------------------------------------------
+  - id: door_lock_pause_expired
+    alias: "Türschlösser - Pause abgelaufen"
+    description: "Info-Push wenn Pause eines Locks endet."
+    mode: parallel
+    max: 20
+
+    triggers:
+      # Pro Lock mit pause_until-Helper eine Zeile — <SLUG> jeweils ersetzen:
+      - trigger: time
+        at: input_datetime.autolock_<SLUG>_pause_until
+      # - trigger: time
+      #   at: input_datetime.autolock_<SLUG>_pause_until
+
+    actions:
+      - variables:
+          eid: "{{ trigger.entity_id }}"
+          slug: "{{ eid | replace('input_datetime.autolock_', '') | regex_replace('_pause_until$', '') }}"
+          lock_entity: "lock.{{ slug }}"
+          friendly_name: "{{ state_attr(lock_entity, 'friendly_name') or lock_entity }}"
+          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
+      - action: "{{ notify_service }}"
+        data:
+          title: "Türschloss Pause beendet"
+          message: >
+            {{ friendly_name }}: Auto-Lock ist wieder aktiv.
+
+  # ---------------------------------------------------------------------------
+  # Entriegelt während Sperrzeit: Info-Push + Auto-Relock wenn Tür zufällt
+  # ---------------------------------------------------------------------------
+  - id: door_lock_unlocked_during_locktime
+    alias: "Türschlösser - Entriegelt während Sperrzeit"
+    description: "Info-Push bei Entriegelung, automatisches Sperren wenn Tür zufällt. Pro Lock eigener State-Trigger, damit ein im Tür-offen-Wait hängender Lock keine anderen blockiert. 60s Puffer für BT-Türkontakt."
+    mode: parallel
+    max: 10
+
+    triggers:
+      # Pro Lock eine state-Trigger-Zeile — <SLUG> jeweils ersetzen:
+      - trigger: state
+        entity_id: lock.<SLUG>
+        from: "locked"
+        to: "unlocked"
+      # - trigger: state
+      #   entity_id: lock.<SLUG>
+      #   from: "locked"
+      #   to: "unlocked"
+
+    conditions:
+      - condition: state
+        entity_id: input_boolean.door_lock_auto_enabled
+        state: "on"
+      - condition: template
+        value_template: >
+          {% set info = (state_attr('sensor.door_locks_active_config', 'locks') or {}).get(trigger.entity_id, {}) %}
+          {{ info.get('active', false) and info.get('in_locktime', false) }}
+
+    actions:
+      - variables:
+          lock_entity: "{{ trigger.entity_id }}"
+          contact_entity: "{{ trigger.entity_id | replace('lock.', 'binary_sensor.') }}"
+          notify_service: "{{ states('input_text.door_lock_notify_service') | trim }}"
+          friendly: "{{ state_attr(lock_entity, 'friendly_name') or lock_entity }}"
+      - action: "{{ notify_service }}"
+        data:
+          title: "Türschloss entriegelt"
+          message: >
+            {{ friendly }} wurde entriegelt ({{ now().strftime('%H:%M') }}).
+            Wird automatisch gesperrt sobald die Tür geschlossen ist.
+      # 60s Puffer: der BT-Türkontakt-Sensor braucht nach dem Entriegeln
+      # einige Sekunden, bis er "Tür offen" meldet. Ohne Puffer sieht der
+      # wait_template unten die Tür fälschlich als "geschlossen" und das
+      # Schloss würde sofort wieder zugesperrt.
+      - delay:
+          seconds: 60
+      - wait_template: "{{ is_state(contact_entity, 'off') }}"
+        timeout:
+          minutes: 60
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ is_state(contact_entity, 'off') and not is_state(lock_entity, 'locked') }}"
+        then:
+          - delay:
+              seconds: 3
+          - action: script.turn_on
+            target:
+              entity_id: script.door_lock_single_with_retry
+            data:
+              variables:
+                lock_entity: "{{ lock_entity }}"
